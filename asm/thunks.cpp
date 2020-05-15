@@ -13,7 +13,9 @@
 //#define IMPL_SUBCLASSING_THUNK
 //#define IMPL_HOOKING_THUNK
 //#define IMPL_FIREONCETIMER_THUNK
-#define IMPL_CLEANUP_THUNK
+//#define IMPL_CLEANUP_THUNK
+//#define IMPL_ASYNCSELECTNOTIFY_THUNK
+#define IMPL_RELEASE_THUNK
 
 #include <stdio.h>
 #include <windows.h>
@@ -39,9 +41,11 @@ LPWSTR __stdcall GetCurrentDateTime()
     return szResult;
 }
 
+int g_dwEbMode = 1;
+
 int __stdcall EbMode()
 {
-    return 1;
+    return g_dwEbMode;
 }
 int __stdcall EbIsResetting()
 {
@@ -256,7 +260,8 @@ void main()
     CryptBinaryToString((BYTE *)AddressOfMethod, THUNK_SIZE, CRYPT_STRING_BASE64, szBuffer, &dwBufSize);
     for(int i = 0, j = 0; (szBuffer[j] = szBuffer[i]) != 0; )
         ++i, j += (szBuffer[j] != '\r' && szBuffer[j] != '\n');
-    printf("Const STR_THUNK     As String = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Dim STR_THUNK       As String: STR_THUNK = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Const THUNK_SIZE    As Long = %d\n", dwSize);
 }
 
 HRESULT __stdcall SubclassProc(void *self, HWND hWnd, UINT uMsg, LPARAM lParam, WPARAM wParam, LRESULT *pRetVal)
@@ -417,7 +422,7 @@ __Release:
         jnz     __exit_Release
         
         // invoke RemoveWindowSubclass(this->hWnd, __SubclassProc, this)
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    edx                             // this ptr (for uIdSubclass)
         push    dword ptr [ecx+t_pfnSubclassProc] // __SubclassProc (for pfnSubclass)
         push    dword ptr [edx+m_hWnd]          // this->hWnd (for hWnd)
@@ -425,7 +430,7 @@ __Release:
         
         // invoke CoTaskMemFree(this)
         mov     edx, dword ptr [esp+4]          // edx = param this
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    edx
         call    dword ptr [ecx+t_pfnCoTaskMemFree] // vtbl->pfnCoTaskMemFree
         xor     eax, eax
@@ -437,8 +442,13 @@ __SubclassProc:
         push    ebp                             
         mov     ebp, esp
         mov     edx, dword ptr [ebp+24]         // this ptr = param uIdSubclass
+        inc     dword ptr [edx+m_dwRefCnt]      // __AddRef
+        // if this->m_pCallbackThis == 0 goto __call_def_subclass
+        mov     eax, dword ptr [edx+m_pCallbackThis]
+        test    eax, eax
+        jz      __call_def_subclass
         // if EbMode() > 1 goto __call_def_subclass
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         mov     eax, dword ptr [ecx+t_pfnEbMode]
         test    eax, eax
         jz      __call_callback
@@ -449,20 +459,20 @@ __SubclassProc:
         cmp     eax, 1
         ja      __call_def_subclass
         // if EbMode() == 0 And wMsg == WM_LBUTTONDBLCLK goto __call_def_subclass
-        cmp     eax, 0
-        jne     __not_design_time
+        test    eax, eax
+        jnz     __not_design_time
         cmp     dword ptr [ebp+12], WM_LBUTTONDBLCLK
         je      __call_def_subclass
 __not_design_time:
         // if EbIsResetting() goto __call_def_subclass
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    edx
         call    dword ptr [ecx+t_pfnEbIsResetting]
         pop     edx                             // restore this ptr
         test    eax, eax
         jnz     __call_def_subclass
         // invoke GetWindowLong(this->hIdeOwner, GWL_STYLE)
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    edx
         push    GWL_STYLE
         push    dword ptr [ecx+t_hIdeOwner]
@@ -491,13 +501,19 @@ __call_callback:
         test    ecx, ecx
         jnz     __exit_SubclassProc
 __call_def_subclass:
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        push    edx
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    dword ptr [ebp+20]              // param lParam
         push    dword ptr [ebp+16]              // param wParam
         push    dword ptr [ebp+12]              // param uMsg
         push    dword ptr [ebp+8]               // param hWnd
         call    dword ptr [ecx+t_pfnDefSubclassProc]
+        pop     edx
 __exit_SubclassProc:
+        push    eax
+        push    edx
+        call    __Release
+        pop     eax
         pop     ebp
         ret     24
         align   4
@@ -558,7 +574,7 @@ void main()
     CryptBinaryToString((BYTE *)SubclassingThunk, dwSize - sizeof_ThunkData, CRYPT_STRING_BASE64, szBuffer, &dwBufSize);
     for(int i = 0, j = 0; (szBuffer[j] = szBuffer[i]) != 0; )
         ++i, j += (szBuffer[j] != '\r' && szBuffer[j] != '\n');
-    printf("    Const STR_THUNK     As String = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Dim STR_THUNK       As String: STR_THUNK = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
     printf("    Const THUNK_SIZE    As Long = %d\n", dwSize);
 }
 
@@ -658,7 +674,7 @@ __skip_init_thunk_data:
         push    edx
         push    sizeof_InstanceData
         call    dword ptr [edx+t_pfnCoTaskMemAlloc]
-        pop     edx
+        pop     edx                             // restore this ptr
         mov     edi, eax                        // edi = this ptr
 
         // init instance members
@@ -751,13 +767,13 @@ __Release:
         jnz     __exit_Release
         
         // invoke UnhookWindowsHookEx(this->hHook)
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    dword ptr [edx+m_hHook]         // this->hHook (for hhk)
         call    dword ptr [ecx+t_pfnUnhookWindowsHookEx]
         
         // invoke CoTaskMemFree(this)
         mov     edx, dword ptr [esp+4]          // param this
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    edx
         call    dword ptr [ecx+t_pfnCoTaskMemFree]
         xor     eax, eax
@@ -769,31 +785,36 @@ __HookProc:
         push    ebp
         mov     ebp, esp
         mov     edx, dword ptr [ebp+8]          // this ptr
+        inc     dword ptr [edx+m_dwRefCnt]      // __AddRef
+        // if this->m_pCallbackThis == 0 goto __call_next_hook
+        mov     eax, dword ptr [edx+m_pCallbackThis]
+        test    eax, eax
+        jz      __call_next_hook
         // if EbMode() > 1 goto __call_next_hook
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         mov     eax, dword ptr [ecx+t_pfnEbMode]
         test    eax, eax
         jz      __call_callback
         push    edx
         call    eax                             // this->pfnEbMode
-        pop     edx
+        pop     edx                             // restore this ptr
         mov     dword ptr [edx+m_dwEbMode], eax // save result
         cmp     eax, 1                          // 1 = running
         ja      __call_next_hook
         // if EbIsResetting() goto __call_next_hook
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    edx
         call    dword ptr [ecx+t_pfnEbIsResetting]
         pop     edx                             // restore this ptr
         test    eax, eax
         jnz      __call_next_hook
         // invoke GetWindowLong(this->hIdeOwner, GWL_STYLE)
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    edx
         push    GWL_STYLE
         push    dword ptr [ecx+t_hIdeOwner]
         call    dword ptr [ecx+t_pfnGetWindowLong]
-        pop     edx
+        pop     edx                             // restore this ptr
         test    eax, WS_DISABLED
         jnz     __call_next_hook
 __call_callback:
@@ -812,18 +833,24 @@ __call_callback:
         call    dword ptr [edx+m_pfnCallback]
         pop     ecx                             // Handled
         pop     eax                             // RetVal
-        pop     edx
+        pop     edx                             // restore this ptr
         test    ecx, ecx
         jnz     __exit_HookProc
 __call_next_hook:
         // invoke CallNextHookEx(hHook, nCode, wParam, lParam)
-        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        push    edx
+        mov     ecx, dword ptr [edx+m_pVtbl]    // ecx = this->pVtbl
         push    dword ptr [ebp+20]              // param lParam
         push    dword ptr [ebp+16]              // param wParam
         push    dword ptr [ebp+12]              // param nCode
         push    dword ptr [edx+m_hHook]
         call    dword ptr [ecx+t_pfnCallNextHookEx]
+        pop     edx                             // restore this ptr
 __exit_HookProc:
+        push    eax
+        push    edx
+        call    __Release
+        pop     eax
         pop     ebp
         ret     16
         align   4
@@ -893,7 +920,7 @@ void main()
     CryptBinaryToString((BYTE *)HookingThunk, dwSize, CRYPT_STRING_BASE64, szBuffer, &dwBufSize);
     for(int i = 0, j = 0; (szBuffer[j] = szBuffer[i]) != 0; )
         ++i, j += (szBuffer[j] != '\r' && szBuffer[j] != '\n');
-    printf("    Const STR_THUNK     As String = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Dim STR_THUNK       As String: STR_THUNK = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
     printf("    Const THUNK_SIZE    As Long = %d\n", dwThunkSize);
 }
 
@@ -1126,6 +1153,10 @@ __exit_Release:
         align   4
 __TimerProc:
         mov     edx, dword ptr [esp+4]          // this ptr
+        // if this->m_pCallbackThis == 0 goto __call_next_hook
+        mov     eax, dword ptr [edx+m_pCallbackThis]
+        test    eax, eax
+        jz      __skip_callback
         // if EbMode() > 1 goto __skip_callback
         mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
         mov     eax, dword ptr [ecx+t_pfnEbMode]
@@ -1222,10 +1253,6 @@ void main()
     IUnknown *pUnk = 0;
     DWORD dwSize = CallWindowProc((WNDPROC)hThunk, 0, 0xABC, (WPARAM)&p, (LPARAM)&pUnk);
     printf("dwSize=%d\nsizeof_InstanceData=%d\n", dwSize, sizeof_InstanceData);
-    dwSize -= countof_PushParamThunk * sizeof_PushParamThunk;
-    printf("offset __PushParamThunk=%d\n", dwSize);
-    dwSize -= sizeof_ThunkData;
-    printf("offset __vtable=%d\n", dwSize);
     MSG uMsg;
     while (GetMessage(&uMsg, 0, 0, 0) != 0) {
         TranslateMessage(&uMsg);
@@ -1240,10 +1267,11 @@ void main()
     printf("pUnk->Release=%d\n", pUnk->Release());
     WCHAR szBuffer[1000];
     DWORD dwBufSize = _countof(szBuffer);
-    CryptBinaryToString((BYTE *)FireOnceTimerThunk, dwSize, CRYPT_STRING_BASE64, szBuffer, &dwBufSize);
+    CryptBinaryToString((BYTE *)FireOnceTimerThunk, THUNK_SIZE - sizeof_ThunkData, CRYPT_STRING_BASE64, szBuffer, &dwBufSize);
     for(int i = 0, j = 0; (szBuffer[j] = szBuffer[i]) != 0; )
         ++i, j += (szBuffer[j] != '\r' && szBuffer[j] != '\n');
-    printf("Const STR_THUNK     As String = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Dim STR_THUNK       As String: STR_THUNK = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Const THUNK_SIZE    As Long = %d\n", dwSize);
 }
 
 HRESULT __stdcall TimerProc(void *self, LRESULT *pRetVal)
@@ -1422,6 +1450,484 @@ void main()
     CryptBinaryToString((BYTE *)CleanupThunk, dwSize - sizeof_ThunkData, CRYPT_STRING_BASE64, szBuffer, &dwBufSize);
     for(int i = 0, j = 0; (szBuffer[j] = szBuffer[i]) != 0; )
         ++i, j += (szBuffer[j] != '\r' && szBuffer[j] != '\n');
-    printf("Const STR_THUNK     As String = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Dim STR_THUNK       As String: STR_THUNK = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Const THUNK_SIZE    As Long = %d\n", dwSize);
 }
+#endif
+
+#ifdef IMPL_ASYNCSELECTNOTIFY_THUNK
+struct InParams {
+    void *pCallbackThis;
+    void *pfnCallback;
+    void *pfnSetWindowSubclass;
+    void *pfnRemoveWindowSubclass;
+    void *pfnDefSubclassProc;
+    void *pfnSetTimer;
+    void *pfnKillTimer;
+    int hIdeOwner;
+    void *pfnGetWindowLong;
+    void *pfnEbMode;
+    void *pfnEbIsResetting;
+};
+
+enum InstanceData {
+    m_pVtbl = 0,
+    m_dwRefCnt = 4,
+    m_dwEbMode = 8,
+    m_hWnd = 12,
+    m_dwTimerID = 16,
+    m_pCallbackThis = 20,
+    m_pfnCallback = 24,
+    m_dwStartIdx = 28,
+    m_dwEndIdx = 32,
+    sizeof_InstanceData = 36,
+    countof_Msg = 1024,
+    sizeof_Msg = 12,
+};
+enum ThunkData {
+    t_pfnQI = 0,
+    t_pfnAddRef = 4,
+    t_pfnRelease = 8,
+    t_pfnSubclassProc = 12,
+    t_pfnTimerProc = 16,
+    t_pfnSetWindowSubclass = 20,
+    t_pfnRemoveWindowSubclass = 24,
+    t_pfnDefSubclassProc = 28,
+    t_pfnSetTimer = 32,
+    t_pfnKillTimer = 36,
+    t_hIdeOwner = 40,
+    t_pfnGetWindowLong = 44,
+    t_pfnEbMode = 48,
+    t_pfnEbIsResetting = 52,
+    sizeof_ThunkData = 56,
+    countof_pfn = (t_pfnEbIsResetting - t_pfnSetWindowSubclass) / 4 + 1,
+};
+
+__declspec(naked, noinline)
+void __stdcall AsyncSelectNotifyThunk(int hWnd, int uMsg, int wParam, int lParam)
+{
+    __asm {
+__start:
+        call    __next
+__next:
+        pop     edx
+        sub     edx, 5+offset __start
+        push    edi
+        push    esi
+        // init thunk data
+        mov     esi, dword ptr [esp+20]         // param wParam
+        add     esi, 8
+        cmp     dword ptr [esi], 0              // wParam->pfnCoTaskMemAlloc
+        jz      __skip_init_thunk_data
+        mov     edi, edx
+        add     edi, offset __vtable
+        mov     eax, edx
+        add     eax, offset __QI
+        stosd                                   // vtbl->pfnQI
+        mov     eax, edx
+        add     eax, offset __AddRef
+        stosd                                   // vtbl->pfnAddRef
+        mov     eax, edx
+        add     eax, offset __Release
+        stosd                                   // vtbl->pfnRelease
+        mov     eax, edx
+        add     eax, offset __SubclassProc
+        stosd                                   // vtbl->pfnSubclassProc
+        mov     eax, edx
+        add     eax, offset __TimerProc
+        stosd                                   // vtbl->pfnTimerProc
+        mov     ecx, countof_pfn
+        rep     movsd                           // vtbl->pfn*
+__skip_init_thunk_data:
+        // init instance members
+        add     edx, offset __vtable
+        mov     edi, edx
+        add     edi, sizeof_ThunkData
+        mov     eax, edx
+        stosd                                   // this->pVtbl
+        mov     eax, 1
+        stosd                                   // this->dwRefCnt
+        xor     eax, eax
+        stosd                                   // this->dwEbMode
+        mov     eax, dword ptr [esp+12]         // param hWnd
+        stosd                                   // this->hWnd
+        xor     eax, eax
+        stosd                                   // this->dwTimerID
+        mov     esi, dword ptr [esp+20]         // param wParam
+        movsd                                   // wParam->pCallbackThis
+        movsd                                   // wParam->pfnCallback
+        xor     eax, eax
+        stosd                                   // this->StartIdx
+        stosd                                   // this->EndIdx
+        sub     edi, sizeof_InstanceData        // rewind this ptr
+        // invoke SetWindowSubclass(hWnd, __SubclassProc, this, 0)
+        push    0                               // 0 (for dwRefData)
+        push    edi                             // this ptr (for uIdSubclass)
+        push    dword ptr [edx+t_pfnSubclassProc] // vtbl->pfnSubclassProc (for pfnSubclass)
+        push    dword ptr [edi+m_hWnd]          // this->hWnd (for hWnd)
+        call    dword ptr [edx+t_pfnSetWindowSubclass]
+        // retval & epilog
+        mov     eax, dword ptr [esp+24]         // param lParam
+        mov     dword ptr [eax], edi            // *lParam = this
+        pop     esi
+        pop     edi
+        mov     eax, offset __MsgTable
+        sub     eax, offset __start
+        add     eax, countof_Msg * sizeof_Msg
+        ret     16
+
+        align   4
+__QI:
+        mov     eax, dword ptr [esp+8]          // eax = param riid
+        cmp     dword ptr [eax+0], 0
+        jne     __nointerface
+        cmp     dword ptr [eax+4], 0
+        jne     __nointerface
+        cmp     dword ptr [eax+8], 0xC0
+        jne     __nointerface
+        cmp     dword ptr [eax+12], 0x46000000
+        jne     __nointerface
+        mov     edx, dword ptr [esp+4]          // edx = param this
+        inc     dword ptr [edx+m_dwRefCnt]
+        mov     eax, dword ptr [esp+12]         // eax = param ppvObject
+        mov     dword ptr [eax], edx            // *ppvObject = this
+        xor     eax, eax
+        ret     12
+__nointerface:
+        mov     eax, 0x80004002                 // E_NOINTERFACE
+        ret     12
+
+        align   4
+__AddRef:
+        mov     edx, dword ptr [esp+4]          // edx = param this
+        inc     dword ptr [edx+m_dwRefCnt]
+        mov     eax, dword ptr [edx+m_dwRefCnt]
+        ret     4
+
+        align   4
+__Release:
+        mov     edx, dword ptr [esp+4]          // edx = param this
+        dec     dword ptr [edx+m_dwRefCnt]
+        mov     eax, dword ptr [edx+m_dwRefCnt]
+        jnz     __exit_Release
+        // invoke RemoveWindowSubclass(this->hWnd, __SubclassProc, this)
+        push    edx
+        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        push    edx                             // this ptr (for uIdSubclass)
+        push    dword ptr [ecx+t_pfnSubclassProc] // __SubclassProc (for pfnSubclass)
+        push    dword ptr [edx+m_hWnd]          // this->hWnd (for hWnd)
+        call    dword ptr [ecx+t_pfnRemoveWindowSubclass] // vtbl->pfnRemoveWindowSubclass
+        pop     edx                             // restore this ptr
+        // invoke KillTimer(0, this->dwTimerId)
+        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        push    dword ptr [edx+m_dwTimerID]     // this->TimerID (for uIDEvent)
+        push    0                               // 0 (for hWnd)
+        call    dword ptr [ecx+t_pfnKillTimer]
+        xor     eax, eax
+__exit_Release:
+        ret     4
+
+        align   4
+__SubclassProc:
+        push    ebp                             
+        mov     ebp, esp
+        mov     edx, dword ptr [ebp+24]         // this ptr = param uIdSubclass
+        inc     dword ptr [edx+m_dwRefCnt]      // __AddRef
+__call_def_subclass:
+        push    edx
+        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        push    dword ptr [ebp+20]              // param lParam
+        push    dword ptr [ebp+16]              // param wParam
+        push    dword ptr [ebp+12]              // param uMsg
+        push    dword ptr [ebp+8]               // param hWnd
+        call    dword ptr [ecx+t_pfnDefSubclassProc]
+        pop     edx                             // restore this ptr
+        push    eax                             // save DefSubclassProc result
+        // save param uMsg, wParam and lParam in __MsgTable[this->EndIdx] slot
+        push    esi
+        push    edi
+        lea     edi, dword ptr [edx+sizeof_InstanceData] // edi = addressof __MsgTable[this->EndIdx]
+        mov     eax, dword ptr [edx+m_dwEndIdx]
+        lea     edi, dword ptr [edi+8*eax]
+        lea     edi, dword ptr [edi+4*eax]
+        lea     esi, dword ptr [ebp+12]         // esi = addressof param uMsg
+        movsd
+        movsd
+        movsd
+        pop     edi
+        pop     esi
+        inc     dword ptr [edx+m_dwEndIdx]
+        and     dword ptr [edx+m_dwEndIdx], countof_Msg - 1
+        // if this->m_dwTimerID <> 0 goto __exit_SubclassProc
+        mov     eax, dword ptr [edx+m_dwTimerID]
+        test    eax, eax
+        jnz     __exit_SubclassProc
+        // if EbMode() > 1 goto __start_callback_timer
+        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     eax, dword ptr [ecx+t_pfnEbMode]
+        test    eax, eax
+        jz      __call_callback_SubclassProc
+        push    edx
+        call    eax
+        pop     edx                             // restore this ptr
+        mov     dword ptr [edx+m_dwEbMode], eax // save result
+        cmp     eax, 1
+        ja      __start_callback_timer
+        // if EbIsResetting() goto __start_callback_timer
+        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        push    edx
+        call    dword ptr [ecx+t_pfnEbIsResetting]
+        pop     edx                             // restore this ptr
+        test    eax, eax
+        jnz     __start_callback_timer
+        // invoke GetWindowLong(this->hIdeOwner, GWL_STYLE)
+        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        push    edx
+        push    GWL_STYLE
+        push    dword ptr [ecx+t_hIdeOwner]
+        call    dword ptr [ecx+t_pfnGetWindowLong]
+        pop     edx                             // restore this ptr
+        test    eax, WS_DISABLED
+        jnz     __start_callback_timer
+__call_callback_SubclassProc:
+        push    dword ptr [edx+m_dwEndIdx]
+        // invoke this->m_pfnCallback(addressof __MsgTable, countof_Msg, this->StartIdx, this->EndIdx)
+        push    edx
+        xor     eax, eax                        // pRetVal
+        push    eax
+        push    esp
+        push    dword ptr [edx+m_dwEndIdx]
+        push    dword ptr [edx+m_dwStartIdx]
+        push    countof_Msg
+        lea     eax, dword ptr [edx+sizeof_InstanceData]
+        push    eax
+        push    dword ptr [edx+m_pCallbackThis]
+        call    dword ptr [edx+m_pfnCallback]
+        pop     eax                             // ignore retval
+        pop     edx                             // restore this ptr
+        pop     eax                             // assign this->m_StartIdx = this->EndIdx
+        mov     dword ptr [edx+m_dwStartIdx], eax
+        cmp     eax, dword ptr [edx+m_dwEndIdx]
+        je      __exit_SubclassProc
+        mov     eax, dword ptr [edx+m_hWnd]
+        test    eax, eax
+        jz      __exit_SubclassProc
+        jmp     __call_callback_SubclassProc
+__start_callback_timer:
+        // this->dwTimerID = SetTimer(0, 0, 0, __TimerProc)
+        push    edx
+        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        push    dword ptr [ecx+t_pfnTimerProc]  // __TimerProc (for lpTimerFunc)
+        push    0                               // param wMsg (for Delay)
+        push    0                               // for nIDEvent
+        push    0                               // for hWnd
+        call    dword ptr [ecx+t_pfnSetTimer]
+        pop     edx                             // restore this ptr
+        mov     dword ptr [edx+m_dwTimerID], eax
+__exit_SubclassProc:
+        push    edx
+        call    __Release
+        pop     eax                             // saved DefSubclassProc result
+        pop     ebp
+        ret     24
+
+        align   4
+__TimerProc:
+        call    __next_timer
+__next_timer:
+        pop     edx
+        sub     edx, 5+offset __TimerProc
+        add     edx, offset __InstanceData      // edx = this
+        inc     dword ptr [edx+m_dwRefCnt]      // __AddRef
+        // if EbMode() > 1 goto __exit_TimerProc
+        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        mov     eax, dword ptr [ecx+t_pfnEbMode]
+        test    eax, eax
+        jz      __kill_timer
+        push    edx
+        call    eax
+        pop     edx                             // restore this ptr
+        mov     dword ptr [edx+m_dwEbMode], eax // save result
+        cmp     eax, 1
+        ja      __exit_TimerProc
+__kill_timer:
+        // invoke KillTimer(0, this->dwTimerId)
+        push    edx
+        mov     ecx, dword ptr [edx]            // ecx = this->pVtbl
+        push    dword ptr [edx+m_dwTimerID]     // this->TimerID (for uIDEvent)
+        push    0                               // 0 (for hWnd)
+        call    dword ptr [ecx+t_pfnKillTimer]
+        pop     edx                             // restore this ptr
+__call_callback_TimerProc:
+        push    dword ptr [edx+m_dwEndIdx]
+        // invoke this->m_pfnCallback(addressof __MsgTable, countof_Msg, this->StartIdx, this->EndIdx)
+        push    edx
+        xor     eax, eax                        // pRetVal
+        push    eax
+        push    esp
+        push    dword ptr [edx+m_dwEndIdx]
+        push    dword ptr [edx+m_dwStartIdx]
+        push    countof_Msg
+        lea     eax, dword ptr [edx+sizeof_InstanceData]
+        push    eax
+        push    dword ptr [edx+m_pCallbackThis]
+        call    dword ptr [edx+m_pfnCallback]
+        pop     eax                             // ignore retval
+        pop     edx                             // restore this ptr
+        pop     eax                             // assign this->StartIdx = this->EndIdx
+        mov     dword ptr [edx+m_dwStartIdx], eax 
+        cmp     eax, dword ptr [edx+m_dwEndIdx]
+        je      __clear_TimerID
+        mov     eax, dword ptr [edx+m_hWnd]
+        test    eax, eax
+        jz      __clear_TimerID
+        jmp     __call_callback_TimerProc
+__clear_TimerID:
+        mov     dword ptr [edx+m_dwTimerID], 0  // note: clear this->TimerId *after* callback
+__exit_TimerProc:
+        push    edx
+        call    __Release
+        ret     16
+
+        align   4
+__vtable:
+        lea     eax,[eax+eax*2+1]               // t_pfnQI
+        lea     eax,[eax+eax*2+1]               // t_pfnAddRef
+        lea     eax,[eax+eax*2+1]               // t_pfnRelease
+        lea     eax,[eax+eax*2+1]               // t_pfnSubclassProc
+        lea     eax,[eax+eax*2+1]               // t_pfnTimerProc
+        lea     eax,[eax+eax*2+1]               // t_pfnSetWindowSubclass
+        lea     eax,[eax+eax*2+1]               // t_pfnRemoveWindowSubclass
+        lea     eax,[eax+eax*2+1]               // t_pfnDefSubclassProc
+        lea     eax,[eax+eax*2+1]               // t_pfnSetTimer
+        lea     eax,[eax+eax*2+1]               // t_pfnKillTimer
+        lea     eax,[eax+eax*2+1]               // t_hIdeOwner
+        lea     eax,[eax+eax*2+1]               // t_pfnGetWindowLong
+        lea     eax,[eax+eax*2+1]               // t_pfnEbMode
+        lea     eax,[eax+eax*2+1]               // t_pfnEbIsResetting
+__InstanceData:
+        lea     eax,[eax+eax*2+1]               // m_pVtbl
+        lea     eax,[eax+eax*2+1]               // m_dwRefCnt
+        lea     eax,[eax+eax*2+1]               // m_dwEbMode
+        lea     eax,[eax+eax*2+1]               // m_hWnd
+        lea     eax,[eax+eax*2+1]               // m_dwTimerID
+        lea     eax,[eax+eax*2+1]               // m_pCallbackThis
+        lea     eax,[eax+eax*2+1]               // m_pfnCallback
+        lea     eax,[eax+eax*2+1]               // m_dwStartIdx
+        lea     eax,[eax+eax*2+1]               // m_dwEndIdx
+__MsgTable:
+    }
+}
+
+#define THUNK_SIZE ((char *)main - (char *)AsyncSelectNotifyThunk)
+
+HRESULT __stdcall AsyncSelectNotifyProc(void *self, int table[], int table_size, int start_idx, int end_idx, LRESULT *pRetVal);
+
+void main()
+{
+    CoInitialize(0);
+    LoadLibrary(L"comctl32");
+    void *vtbl[] = { AsyncSelectNotifyProc };
+    void *pObj[] = { vtbl };
+    InParams p = { 0 };
+    p.pCallbackThis = pObj;
+    p.pfnCallback = AsyncSelectNotifyProc;
+    p.pfnSetWindowSubclass = GetProcAddress(GetModuleHandle(L"comctl32"), "SetWindowSubclass");
+    p.pfnRemoveWindowSubclass = GetProcAddress(GetModuleHandle(L"comctl32"), "RemoveWindowSubclass");
+    p.pfnDefSubclassProc = GetProcAddress(GetModuleHandle(L"comctl32"), "DefSubclassProc");
+    p.pfnSetTimer = GetProcAddress(GetModuleHandle(L"user32"), "SetTimer");
+    p.pfnKillTimer = GetProcAddress(GetModuleHandle(L"user32"), "KillTimer");
+    p.hIdeOwner = 0x1C520D8C;
+    p.pfnGetWindowLong = GetProcAddress(GetModuleHandle(L"user32"), "GetWindowLongA");
+    p.pfnEbMode = EbMode;
+    p.pfnEbIsResetting = EbIsResetting;
+    HWND hWnd = CreateWindowEx(0, L"STATIC", L"Test", 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    printf("hWnd=%p\n", hWnd);
+    void *hThunk = VirtualAlloc(0, 0x10000, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    printf("hThunk=%p\nTHUNK_SIZE=%d\n", hThunk, THUNK_SIZE);
+    memcpy(hThunk, AsyncSelectNotifyThunk, THUNK_SIZE);
+    IUnknown *pUnk = 0;
+    DWORD dwSize = CallWindowProc((WNDPROC)hThunk, hWnd, 0, (WPARAM)&p, (LPARAM)&pUnk);
+    printf("dwSize=%d\nsizeof_InstanceData=%d\nsizeof_ThunkData=%d\n", dwSize, sizeof_InstanceData, sizeof_ThunkData);
+    SendMessage(hWnd, WM_USER, 0, 0);
+    g_dwEbMode = 2;
+    PostMessage(hWnd, WM_SETFOCUS, 0, 0);
+    PostMessage(hWnd, WM_USER, 0, 0);
+    g_dwEbMode = 1;
+    MSG uMsg;
+    while (GetMessage(&uMsg, 0, 0, 0) != 0) {
+        TranslateMessage(&uMsg);
+        DispatchMessage(&uMsg);
+    }
+    printf("pUnk->AddRef=%d\n", pUnk->AddRef());
+    printf("pUnk->Release=%d\n", pUnk->Release());
+    printf("pUnk->Release=%d\n", pUnk->Release());
+    InParams p2 = { 0 };
+    p2.pCallbackThis = pObj;
+    p2.pfnCallback = AsyncSelectNotifyProc;
+    dwSize = CallWindowProc((WNDPROC)hThunk, hWnd, 0, (WPARAM)&p2, (LPARAM)&pUnk);
+    SendMessage(hWnd, WM_USER, 0, 0);
+    printf("pUnk->Release=%d\n", pUnk->Release());
+    WCHAR szBuffer[1000];
+    DWORD dwBufSize = _countof(szBuffer);
+    CryptBinaryToString((BYTE *)AsyncSelectNotifyThunk, THUNK_SIZE - sizeof_InstanceData - sizeof_ThunkData, CRYPT_STRING_BASE64, szBuffer, &dwBufSize);
+    for(int i = 0, j = 0; (szBuffer[j] = szBuffer[i]) != 0; )
+        ++i, j += (szBuffer[j] != '\r' && szBuffer[j] != '\n');
+    printf("    Dim STR_THUNK       As String: STR_THUNK = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Const THUNK_SIZE    As Long = %d\n", dwSize);
+}
+
+HRESULT __stdcall AsyncSelectNotifyProc(void *self, int table[], int table_size, int start_idx, int end_idx, LRESULT *pRetVal)
+{
+    while (start_idx != end_idx) {
+        printf("[%d]: uMsg=0x%X, wParam=0x%X, lParam=0x%X\n", start_idx, table[3*start_idx + 0], table[3*start_idx + 1], table[3*start_idx + 2]);
+        start_idx = (start_idx + 1) & (table_size - 1);
+    }
+    return S_OK;
+}
+#endif
+
+
+#ifdef IMPL_RELEASE_THUNK
+enum InstanceData {
+    m_pVtbl = 0,
+    m_pIPAOReal = 4,
+};
+enum ThunkData {
+    t_pfnQI = 0,
+    t_pfnAddRef = 4,
+    t_pfnRelease = 8,
+};
+
+__declspec(naked, noinline)
+void __stdcall ReleaseThunk()
+{
+    __asm {
+__start:
+__Release:
+        mov     edx, dword ptr [esp+4]          // edx = param this
+        mov     eax, dword ptr [edx+m_pIPAOReal]
+        mov     ecx, dword ptr [eax+m_pVtbl]    // ecx = m_pIPAOReal->pVtbl
+        push    eax
+        call    dword ptr [ecx+t_pfnRelease]
+__exit_Release:
+        ret     4
+    }
+}
+
+#define THUNK_SIZE ((char *)main - (char *)ReleaseThunk)
+
+void main()
+{
+    CoInitialize(0);
+    LoadLibrary(L"comctl32");
+    WCHAR szBuffer[1000];
+    DWORD dwBufSize = _countof(szBuffer);
+    CryptBinaryToString((BYTE *)ReleaseThunk, THUNK_SIZE, CRYPT_STRING_BASE64, szBuffer, &dwBufSize);
+    for(int i = 0, j = 0; (szBuffer[j] = szBuffer[i]) != 0; )
+        ++i, j += (szBuffer[j] != '\r' && szBuffer[j] != '\n');
+    printf("    Dim STR_THUNK       As String: STR_THUNK = \"%S\" ' %S\n", szBuffer, GetCurrentDateTime());
+    printf("    Const THUNK_SIZE    As Long = %d\n", THUNK_SIZE);
+}
+
 #endif
